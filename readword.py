@@ -1,53 +1,108 @@
 import argparse
 import asyncio
-import keyboard
-import sys
-import re
-import os
+import concurrent.futures
+import ctypes
+import hashlib
 import json
-import win32com.client
-from typing import Optional, List, Tuple
-import winreg
+import os
+import re
+import sys
+import threading
+import unicodedata
 from datetime import datetime
-from xml.sax.saxutils import escape
+from typing import Dict, List, Optional, Tuple
+
+import keyboard
+import win32com.client
+import winreg
 
 try:
-    from winrt.windows.media.speechsynthesis import SpeechSynthesizer
+    import edge_tts
+
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    edge_tts = None
+    EDGE_TTS_AVAILABLE = False
+
+try:
     from winrt.windows.media.playback import MediaPlayer, MediaPlayerAudioCategory
+    from winrt.windows.media.speechsynthesis import SpeechSynthesizer
+
     WINRT_AVAILABLE = True
 except ImportError:
-    SpeechSynthesizer = None
     MediaPlayer = None
     MediaPlayerAudioCategory = None
+    SpeechSynthesizer = None
     WINRT_AVAILABLE = False
+
 
 # --- CONFIGURATION ---
 
-# Map symbols to (Display Text, Spoken Text)
 TOKEN_MAP = {
-    '\n': ("<NEW LINE>", "new line"),
-    '...': ("<ELLIPSIS>", "ellipsis"),
-    '…': ("<ELLIPSIS>", "ellipsis"),
-    '.': ("<PERIOD>", "period"),
-    ',': ("<COMMA>", "comma"),
-    ':': ("<COLON>", "colon"),
-    ';': ("<SEMICOLON>", "semicolon"),
-    '!': ("<EXCLAMATION>", "exclamation mark"),
-    '?': ("<QUESTION>", "question mark"),
+    "\n": ("<NEW LINE>", "new line"),
+    "...": ("<ELLIPSIS>", "ellipsis"),
+    "…": ("<ELLIPSIS>", "ellipsis"),
+    ".": ("<PERIOD>", "period"),
+    ",": ("<COMMA>", "comma"),
+    ":": ("<COLON>", "colon"),
+    ";": ("<SEMICOLON>", "semicolon"),
+    "!": ("<EXCLAMATION>", "exclamation mark"),
+    "?": ("<QUESTION>", "question mark"),
     '"': ("<QUOTE>", "quote"),
-    '“': ("<QUOTE>", "quote"),
-    '”': ("<QUOTE>", "quote"),
-    '-': ("<DASH>", "dash"),
-    '—': ("<EM DASH>", "dash"),
+    "“": ("<QUOTE>", "quote"),
+    "”": ("<QUOTE>", "quote"),
+    "-": ("<DASH>", "dash"),
+    "—": ("<EM DASH>", "dash"),
+}
+SYMBOL_NAME_MAP = {
+    "(": ("<LEFT PARENTHESIS>", "left parenthesis"),
+    ")": ("<RIGHT PARENTHESIS>", "right parenthesis"),
+    "[": ("<LEFT BRACKET>", "left bracket"),
+    "]": ("<RIGHT BRACKET>", "right bracket"),
+    "{": ("<LEFT BRACE>", "left brace"),
+    "}": ("<RIGHT BRACE>", "right brace"),
+    "<": ("<LESS THAN>", "less than"),
+    ">": ("<GREATER THAN>", "greater than"),
+    "/": ("<SLASH>", "slash"),
+    "\\": ("<BACKSLASH>", "backslash"),
+    "|": ("<VERTICAL BAR>", "vertical bar"),
+    "_": ("<UNDERSCORE>", "underscore"),
+    "=": ("<EQUALS>", "equals sign"),
+    "+": ("<PLUS>", "plus sign"),
+    "*": ("<ASTERISK>", "asterisk"),
+    "&": ("<AMPERSAND>", "ampersand"),
+    "@": ("<AT>", "at sign"),
+    "#": ("<HASH>", "hash sign"),
+    "$": ("<DOLLAR>", "dollar sign"),
+    "%": ("<PERCENT>", "percent sign"),
+    "^": ("<CARET>", "caret"),
+    "~": ("<TILDE>", "tilde"),
+    "`": ("<BACKTICK>", "backtick"),
 }
 
-# Global settings are stored separately from per-book progress.
-SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "readword_settings.json")
+APP_DIR = os.path.dirname(__file__)
+SETTINGS_FILE = os.path.join(APP_DIR, "readword_settings.json")
+CACHE_DIR = os.path.join(APP_DIR, ".tts_cache")
+EDGE_PLAYBACK_ALIAS = "readword_tts"
+EDGE_PREFETCH_TOKENS = 24
+EDGE_STALE_TEMP_SECONDS = 120
 
-# Voices keywords to prioritize (highest priority first).
-# This strongly prefers newer-sounding Microsoft voices when available and
-# avoids the old David desktop voice unless it is the only option.
-PREFERRED_VOICE_TAGS = [
+PREFERRED_EDGE_VOICES = [
+    "en-US-EmmaMultilingualNeural",
+    "en-US-AndrewNeural",
+    "en-US-AvaNeural",
+    "en-US-BrianMultilingualNeural",
+    "en-US-AnaNeural",
+    "en-US-JennyNeural",
+]
+EDGE_VOICE_ALIASES = {
+    "female": "en-US-EmmaMultilingualNeural",
+    "woman": "en-US-EmmaMultilingualNeural",
+    "male": "en-US-AndrewNeural",
+    "man": "en-US-AndrewNeural",
+}
+
+PREFERRED_LOCAL_VOICE_TAGS = [
     "Aria",
     "Jenny",
     "Guy",
@@ -58,49 +113,88 @@ PREFERRED_VOICE_TAGS = [
     "Neural",
     "Mobile",
 ]
-DISFAVORED_VOICE_TAGS = ["Desktop", "David"]
-
-WINRT_VOICE_PROFILES = {
-    "microsoft mark": {"rate": "+8%", "pitch": "+8%", "volume": "100"},
-    "microsoft zira": {"rate": "+6%", "pitch": "+6%", "volume": "100"},
-    "microsoft david": {"rate": "+4%", "pitch": "+2%", "volume": "100"},
-}
-DEFAULT_WINRT_PROFILE = {"rate": "+6%", "pitch": "+6%", "volume": "100"}
+DISFAVORED_LOCAL_VOICE_TAGS = ["Desktop", "David"]
 
 
 class WindowsSpeechEngine:
-    def __init__(self, preferred_voice: Optional[str] = None, prompt_for_voice: bool = False, quiet: bool = False):
-        """Initialize the best available Windows speech engine with voice selection."""
+    def __init__(
+        self,
+        preferred_voice: Optional[str] = None,
+        prompt_for_voice: bool = False,
+        quiet: bool = False,
+        backend_preference: str = "auto",
+    ):
         self.settings_file = SETTINGS_FILE
-        self.preferred_voice = preferred_voice
-        self.prompt_for_voice = prompt_for_voice
         self.quiet = quiet
         self.backend = "sapi"
-        self.player = None
+        self.backend_preference = backend_preference
         self.current_stream = None
+        self.player = None
+        self.edge_voice_catalog: Optional[List[dict]] = None
+        self.edge_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self.edge_futures: Dict[str, concurrent.futures.Future] = {}
+        self.edge_lock = threading.Lock()
+        self.winmm = ctypes.windll.winmm
 
-        if not self._init_winrt():
-            self._init_sapi()
+        os.makedirs(CACHE_DIR, exist_ok=True)
 
+        if not self._initialize_backend(backend_preference):
+            raise RuntimeError("No speech backend could be initialized.")
+
+        self._repair_cache(startup=True)
         self._select_voice(preferred_voice, prompt_for_voice)
+
+    def _initialize_backend(self, backend_preference: str) -> bool:
+        backend_order = []
+        if backend_preference == "edge":
+            backend_order = ["edge", "winrt", "sapi"]
+        elif backend_preference == "winrt":
+            backend_order = ["winrt", "sapi"]
+        elif backend_preference == "sapi":
+            backend_order = ["sapi"]
+        else:
+            backend_order = ["edge", "winrt", "sapi"]
+
+        for backend_name in backend_order:
+            try:
+                if backend_name == "edge" and self._init_edge():
+                    return True
+                if backend_name == "winrt" and self._init_winrt():
+                    return True
+                if backend_name == "sapi" and self._init_sapi():
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    def _init_edge(self) -> bool:
+        if not EDGE_TTS_AVAILABLE:
+            return False
+
+        self.backend = "edge"
+        self.selected_voice = None
+        self.edge_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="readword_edge_tts",
+        )
+        self.voices = list(PREFERRED_EDGE_VOICES)
+        return True
 
     def _init_winrt(self) -> bool:
         if not WINRT_AVAILABLE:
             return False
 
-        try:
-            self.backend = "winrt"
-            self.synthesizer = SpeechSynthesizer()
-            self.player = MediaPlayer()
-            self.player.audio_category = MediaPlayerAudioCategory.SPEECH
-            self.player.real_time_playback = True
-            self.player.auto_play = False
-            self.voices = list(SpeechSynthesizer.all_voices)
-            return bool(self.voices)
-        except Exception:
-            return False
+        self.backend = "winrt"
+        self.synthesizer = SpeechSynthesizer()
+        self.player = MediaPlayer()
+        self.player.audio_category = MediaPlayerAudioCategory.SPEECH
+        self.player.real_time_playback = True
+        self.player.auto_play = False
+        self.voices = list(SpeechSynthesizer.all_voices)
+        return bool(self.voices)
 
-    def _init_sapi(self):
+    def _init_sapi(self) -> bool:
         self.backend = "sapi"
         self._refresh_speech_tokens()
         self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
@@ -108,18 +202,15 @@ class WindowsSpeechEngine:
         self.speaker.Volume = 100
         raw_voices = self.speaker.GetVoices()
         self.voices = [raw_voices.Item(i) for i in range(raw_voices.Count)]
+        return bool(self.voices)
 
     def _refresh_speech_tokens(self):
-        """Registry hack to make sure all voices appear."""
         try:
             path = r"SOFTWARE\Microsoft\Speech\Voices\Tokens"
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_READ) as key:
                 winreg.EnumKey(key, 0)
         except Exception:
-            pass # Fail silently, this is just a helper
-
-    def list_voice_descriptions(self) -> List[str]:
-        return [self._voice_name(voice) for voice in self.voices]
+            pass
 
     def _load_settings(self) -> dict:
         if not os.path.exists(self.settings_file):
@@ -142,56 +233,91 @@ class WindowsSpeechEngine:
         except Exception:
             pass
 
-    def _score_voice(self, description: str) -> int:
+    def _load_edge_voice_catalog(self) -> List[dict]:
+        if self.edge_voice_catalog is not None:
+            return self.edge_voice_catalog
+
+        if self.backend != "edge":
+            return []
+
+        async def load():
+            return await edge_tts.list_voices()
+
+        voices = asyncio.run(load())
+        self.edge_voice_catalog = [voice for voice in voices if voice.get("Locale") == "en-US"]
+        return self.edge_voice_catalog
+
+    def _voice_name(self, voice) -> str:
+        if self.backend == "edge":
+            return voice
+        if self.backend == "winrt":
+            return voice.display_name
+        return voice.GetDescription()
+
+    def _edge_voice_entry(self, short_name: str) -> Optional[dict]:
+        if self.backend != "edge":
+            return None
+
+        for entry in self._load_edge_voice_catalog():
+            if entry.get("ShortName") == short_name:
+                return entry
+
+        return None
+
+    def _voice_label(self, voice) -> str:
+        if self.backend != "edge":
+            return self._voice_name(voice)
+
+        short_name = self._voice_name(voice)
+        entry = self._edge_voice_entry(short_name)
+        if entry:
+            gender = entry.get("Gender")
+            gender_label = f" [{gender}]" if gender else ""
+            return f"{short_name} - {entry.get('FriendlyName')}{gender_label}"
+
+        return short_name
+
+    def list_voice_descriptions(self) -> List[str]:
+        if self.backend == "edge":
+            return [self._voice_label(voice) for voice in self._load_edge_voice_catalog_entries()]
+
+        return [self._voice_name(voice) for voice in self.voices]
+
+    def _load_edge_voice_catalog_entries(self) -> List[str]:
+        catalog = self._load_edge_voice_catalog()
+        ordered = []
+        seen = set()
+
+        for short_name in PREFERRED_EDGE_VOICES:
+            for entry in catalog:
+                if entry.get("ShortName") == short_name and short_name not in seen:
+                    ordered.append(short_name)
+                    seen.add(short_name)
+
+        for entry in catalog:
+            short_name = entry.get("ShortName")
+            if short_name and short_name not in seen:
+                ordered.append(short_name)
+                seen.add(short_name)
+
+        return ordered
+
+    def _score_local_voice(self, description: str) -> int:
         normalized = description.casefold()
         score = 0
 
-        for priority, tag in enumerate(PREFERRED_VOICE_TAGS):
+        for priority, tag in enumerate(PREFERRED_LOCAL_VOICE_TAGS):
             if tag.casefold() in normalized:
                 score += 100 - (priority * 10)
 
-        for tag in DISFAVORED_VOICE_TAGS:
+        for tag in DISFAVORED_LOCAL_VOICE_TAGS:
             if tag.casefold() in normalized:
                 score -= 35
 
         if "english (united states)" in normalized:
             score += 20
-        if normalized.startswith("microsoft "):
-            score += 5
 
         return score
-
-    def _voice_name(self, voice) -> str:
-        if self.backend == "winrt":
-            return voice.display_name
-        return voice.GetDescription()
-
-    def _current_voice_name(self) -> str:
-        if self.backend == "winrt":
-            voice = self.synthesizer.voice
-            return voice.display_name if voice else ""
-
-        try:
-            return self.speaker.Voice.GetDescription()
-        except Exception:
-            return ""
-
-    def _build_ssml(self, text: str) -> str:
-        voice_name = self._current_voice_name()
-        normalized_voice_name = voice_name.casefold()
-        profile = WINRT_VOICE_PROFILES.get(normalized_voice_name, DEFAULT_WINRT_PROFILE)
-        escaped_text = escape(text)
-        escaped_voice_name = escape(voice_name)
-
-        return (
-            '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-            f'<voice name="{escaped_voice_name}">'
-            f'<prosody rate="{profile["rate"]}" pitch="{profile["pitch"]}" volume="{profile["volume"]}">'
-            f"{escaped_text}"
-            "</prosody>"
-            "</voice>"
-            "</speak>"
-        )
 
     def _find_voice(self, query: Optional[str]):
         if not query:
@@ -199,49 +325,102 @@ class WindowsSpeechEngine:
 
         normalized_query = query.casefold().strip()
 
-        for voice in self.voices:
-            if self._voice_name(voice).casefold() == normalized_query:
-                return voice
+        if self.backend == "edge":
+            alias_target = EDGE_VOICE_ALIASES.get(normalized_query)
+            if alias_target:
+                normalized_query = alias_target.casefold()
+
+            for voice in self._load_edge_voice_catalog_entries():
+                if voice.casefold() == normalized_query:
+                    return voice
+
+            for entry in self._load_edge_voice_catalog():
+                friendly = entry.get("FriendlyName", "").casefold()
+                short_name = entry.get("ShortName", "")
+                if normalized_query in short_name.casefold() or normalized_query in friendly:
+                    return short_name
+
+            return None
 
         for voice in self.voices:
-            if normalized_query in self._voice_name(voice).casefold():
+            description = self._voice_name(voice).casefold()
+            if description == normalized_query or normalized_query in description:
                 return voice
 
         return None
 
     def _pick_best_voice(self):
+        if self.backend == "edge":
+            catalog_voices = set(self._load_edge_voice_catalog_entries())
+            for voice in PREFERRED_EDGE_VOICES:
+                if voice in catalog_voices:
+                    return voice
+            return self._load_edge_voice_catalog_entries()[0] if catalog_voices else PREFERRED_EDGE_VOICES[0]
+
         if not self.voices:
             return None
 
         return max(
             self.voices,
-            key=lambda voice: (self._score_voice(self._voice_name(voice)), self._voice_name(voice)),
+            key=lambda voice: (self._score_local_voice(self._voice_name(voice)), self._voice_name(voice)),
         )
 
+    def _prompt_voice_choices(self, selected_voice) -> List:
+        if self.backend != "edge":
+            return self.voices
+
+        available = self._load_edge_voice_catalog_entries()
+        selected_name = self._voice_name(selected_voice) if selected_voice else None
+        choices = []
+        seen = set()
+
+        explicit_priority = [
+            EDGE_VOICE_ALIASES["female"],
+            EDGE_VOICE_ALIASES["male"],
+        ]
+
+        for voice in explicit_priority + PREFERRED_EDGE_VOICES:
+            if voice in available and voice not in seen:
+                choices.append(voice)
+                seen.add(voice)
+
+        if selected_name and selected_name not in seen:
+            choices.append(selected_name)
+
+        return choices
+
     def _maybe_prompt_for_voice(self, selected_voice):
-        available_voices = self.list_voice_descriptions()
+        choices = self._prompt_voice_choices(selected_voice)
         selected_name = self._voice_name(selected_voice) if selected_voice else None
 
+        if not choices:
+            return selected_voice
+
         print("\n--- Available Voices ---")
-        for i, description in enumerate(available_voices, start=1):
-            marker = " (recommended)" if selected_name and description == selected_name else ""
-            print(f"{i}. {description}{marker}")
+        for i, voice in enumerate(choices, start=1):
+            label = self._voice_label(voice)
+            marker = " (recommended)" if selected_name and self._voice_name(voice) == selected_name else ""
+            if self._voice_name(voice) == EDGE_VOICE_ALIASES["female"]:
+                marker += " (female)"
+            elif self._voice_name(voice) == EDGE_VOICE_ALIASES["male"]:
+                marker += " (male)"
+            print(f"{i}. {label}{marker}")
 
         print("\nPress ENTER to keep the recommended voice, or type a number (1-N) to switch:")
         choice = input("> ").strip()
 
         if choice.isdigit():
             idx = int(choice) - 1
-            if 0 <= idx < len(self.voices):
-                return self.voices[idx]
+            if 0 <= idx < len(choices):
+                return choices[idx]
 
         return selected_voice
 
     def _select_voice(self, preferred_voice: Optional[str], prompt_for_voice: bool):
-        """Find the best available voice and optionally let the user override it."""
         settings = self._load_settings()
         selected_voice = self._find_voice(preferred_voice)
-        if preferred_voice and not selected_voice:
+
+        if preferred_voice and not selected_voice and not self.quiet:
             print(f'Warning: voice "{preferred_voice}" was not found. Falling back to the best available voice.')
 
         if not selected_voice:
@@ -251,31 +430,201 @@ class WindowsSpeechEngine:
         if not selected_voice:
             selected_voice = self._pick_best_voice()
 
-        should_prompt = prompt_for_voice or (
+        should_prompt = (
             not preferred_voice
-            and not settings.get("voice")
-            and len(self.voices) > 1
+            and len(self._prompt_voice_choices(selected_voice)) > 1
             and not self.quiet
-        )
+        ) or prompt_for_voice
 
-        if should_prompt and self.voices:
+        if should_prompt:
             selected_voice = self._maybe_prompt_for_voice(selected_voice)
 
-        if selected_voice:
-            description = self._voice_name(selected_voice)
-            if self.backend == "winrt":
-                self.synthesizer.voice = selected_voice
-            else:
-                self.speaker.Voice = selected_voice
-            self._save_settings({"voice": description})
-            if not self.quiet:
-                backend_name = "WinRT" if self.backend == "winrt" else "SAPI"
-                print(f"Selected voice [{backend_name}]: {description}")
-        elif not self.quiet:
-            print("Using system default voice.")
+        if not selected_voice:
+            raise RuntimeError("No usable voice was found for the selected backend.")
 
-    def say(self, text):
-        """Speak asynchronously."""
+        if self.backend == "edge":
+            self.selected_voice = selected_voice
+        elif self.backend == "winrt":
+            self.synthesizer.voice = selected_voice
+        else:
+            self.speaker.Voice = selected_voice
+
+        self._save_settings({"voice": self._voice_name(selected_voice), "backend": self.backend})
+
+        if not self.quiet:
+            print(f"Selected voice [{self.backend.upper()}]: {self._voice_label(selected_voice)}")
+
+    def _edge_cache_key(self, text: str) -> str:
+        payload = f"{self.selected_voice}|{text}".encode("utf-8")
+        return hashlib.sha1(payload).hexdigest()
+
+    def _edge_cache_path(self, text: str) -> str:
+        key = self._edge_cache_key(text)
+        filename = f"{key}.mp3"
+        return os.path.join(CACHE_DIR, filename)
+
+    def _is_valid_edge_cache_file(self, path: str) -> bool:
+        try:
+            return os.path.isfile(path) and os.path.getsize(path) > 0
+        except OSError:
+            return False
+
+    def _cleanup_edge_temp_files(self, stale_only: bool):
+        if not os.path.isdir(CACHE_DIR):
+            return
+
+        now = datetime.now().timestamp()
+        for name in os.listdir(CACHE_DIR):
+            path = os.path.join(CACHE_DIR, name)
+            if not os.path.isfile(path):
+                continue
+
+            is_temp = ".tmp-" in name
+            is_empty_mp3 = name.endswith(".mp3") and not self._is_valid_edge_cache_file(path)
+            if not is_temp and not is_empty_mp3:
+                continue
+
+            if stale_only:
+                try:
+                    age_seconds = now - os.path.getmtime(path)
+                except OSError:
+                    age_seconds = EDGE_STALE_TEMP_SECONDS + 1
+                if age_seconds < EDGE_STALE_TEMP_SECONDS:
+                    continue
+
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _repair_cache(self, startup: bool = False):
+        if self.backend != "edge":
+            return
+
+        self._cleanup_edge_temp_files(stale_only=startup)
+
+    def _synthesize_edge_file(self, text: str) -> str:
+        output_path = self._edge_cache_path(text)
+        if self._is_valid_edge_cache_file(output_path):
+            return output_path
+
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+        temp_path = f"{output_path}.tmp-{threading.get_ident()}"
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=self.selected_voice,
+            rate="+8%",
+            volume="+0%",
+            pitch="+0Hz",
+        )
+        try:
+            communicate.save_sync(temp_path)
+            if not self._is_valid_edge_cache_file(temp_path):
+                raise RuntimeError("Generated audio file was empty.")
+            os.replace(temp_path, output_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+        return output_path
+
+    def _submit_edge_prefetch(self, text: str):
+        if self.backend != "edge" or not text:
+            return
+
+        cache_path = self._edge_cache_path(text)
+        if self._is_valid_edge_cache_file(cache_path):
+            return
+
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+
+        key = self._edge_cache_key(text)
+        with self.edge_lock:
+            future = self.edge_futures.get(key)
+            if future and not future.done():
+                return
+
+            self.edge_futures[key] = self.edge_executor.submit(self._synthesize_edge_file, text)
+
+    def _ensure_edge_audio(self, text: str) -> str:
+        cache_path = self._edge_cache_path(text)
+        if self._is_valid_edge_cache_file(cache_path):
+            return cache_path
+
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+
+        key = self._edge_cache_key(text)
+        with self.edge_lock:
+            future = self.edge_futures.get(key)
+            if future is None:
+                future = self.edge_executor.submit(self._synthesize_edge_file, text)
+                self.edge_futures[key] = future
+
+        try:
+            return future.result(timeout=20)
+        finally:
+            with self.edge_lock:
+                current = self.edge_futures.get(key)
+                if current is future and future.done():
+                    self.edge_futures.pop(key, None)
+
+    def _mci_error_message(self, code: int) -> str:
+        buffer = ctypes.create_unicode_buffer(255)
+        if self.winmm.mciGetErrorStringW(code, buffer, len(buffer)):
+            return buffer.value
+        return f"MCI error {code}"
+
+    def _mci_command(self, command: str):
+        buffer = ctypes.create_unicode_buffer(255)
+        error_code = self.winmm.mciSendStringW(command, buffer, len(buffer), 0)
+        if error_code:
+            raise RuntimeError(self._mci_error_message(error_code))
+        return buffer.value
+
+    def _stop_edge_playback(self):
+        try:
+            self._mci_command(f"close {EDGE_PLAYBACK_ALIAS}")
+        except Exception:
+            pass
+
+    def _play_edge_file(self, path: str):
+        self._stop_edge_playback()
+        normalized_path = os.path.abspath(path)
+        self._mci_command(f'open "{normalized_path}" alias {EDGE_PLAYBACK_ALIAS}')
+        self._mci_command(f"play {EDGE_PLAYBACK_ALIAS}")
+
+    def prefetch(self, texts: List[str]):
+        if self.backend != "edge":
+            return
+
+        seen = set()
+        for text in texts:
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            self._submit_edge_prefetch(text)
+
+    def say(self, text: str):
+        if self.backend == "edge":
+            path = self._ensure_edge_audio(text)
+            self._play_edge_file(path)
+            return
+
         if self.backend == "winrt":
             try:
                 if self.player:
@@ -284,138 +633,166 @@ class WindowsSpeechEngine:
                 pass
 
             async def synthesize():
-                ssml = self._build_ssml(text)
-                return await self.synthesizer.synthesize_ssml_to_stream_async(ssml)
+                return await self.synthesizer.synthesize_text_to_stream_async(text)
 
             self.current_stream = asyncio.run(synthesize())
             self.player.set_stream_source(self.current_stream)
             self.player.play()
             return
 
-        self.speaker.Speak(text, 1) # 1 = SVSFlagsAsync
+        self.speaker.Speak(text, 1)
 
-    def wait(self):
-        """Block until speaking is done."""
-        if self.backend == "winrt":
+    def shutdown(self):
+        if self.backend == "edge":
+            self._stop_edge_playback()
+            if self.edge_executor:
+                self.edge_executor.shutdown(wait=False, cancel_futures=True)
+            self._repair_cache(startup=False)
             return
-        self.speaker.WaitUntilDone(10000) # Timeout after 10s to prevent hanging
+
+        if self.backend == "winrt":
+            try:
+                if self.player:
+                    self.player.pause()
+                    self.player.close()
+            except Exception:
+                pass
 
 
 class BookReader:
-    def __init__(self, filepath, preferred_voice: Optional[str] = None, prompt_for_voice: bool = False):
+    def __init__(
+        self,
+        filepath: str,
+        preferred_voice: Optional[str] = None,
+        prompt_for_voice: bool = False,
+        backend_preference: str = "auto",
+    ):
         self.filepath = filepath
         self.save_file = os.path.splitext(filepath)[0] + "_progress.json"
         self.engine = WindowsSpeechEngine(
             preferred_voice=preferred_voice,
             prompt_for_voice=prompt_for_voice,
+            backend_preference=backend_preference,
         )
         self.tokens = self._tokenize_file()
         self.position = self._load_progress()
         self.is_running = True
+        self._prime_audio_cache()
 
     def _tokenize_file(self) -> List[str]:
-        """Reads file and returns a list of actionable tokens."""
         if not os.path.exists(self.filepath):
             print(f"Error: File {self.filepath} not found.")
             sys.exit(1)
 
-        with open(self.filepath, 'r', encoding='utf-8') as f:
+        with open(self.filepath, "r", encoding="utf-8") as f:
             text = f.read()
 
-        # Regex Explanation:
-        # 1. \.\.\.           -> Ellipsis (...)
-        # 2. [\w'’]+          -> Words, including STRAIGHT (') and CURLY (’) apostrophes
-        # 3. [^\w\s]          -> Any single character that isn't a word or whitespace
-        # 4. \n               -> Newlines (explicitly captured)
         pattern = r"\.\.\.|[\w'’]+|[^\w\s]|\n"
-        return [t for t in re.findall(pattern, text) if t.strip() or t == '\n']
+        return [t for t in re.findall(pattern, text) if t.strip() or t == "\n"]
 
     def _load_progress(self) -> int:
-        """Loads index from JSON."""
         if os.path.exists(self.save_file):
             try:
-                with open(self.save_file, 'r') as f:
+                with open(self.save_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    pos = data.get('position', 0)
-                    return max(0, min(pos, len(self.tokens) - 1))
+                    position = data.get("position", 0)
+                    return max(0, min(position, len(self.tokens) - 1))
             except Exception:
                 pass
         return 0
 
     def _save_progress(self):
-        """Saves current index to JSON."""
         try:
-            with open(self.save_file, 'w') as f:
-                json.dump({
-                    'position': self.position, 
-                    'timestamp': str(datetime.now())
-                }, f)
+            with open(self.save_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "position": self.position,
+                        "timestamp": str(datetime.now()),
+                    },
+                    f,
+                )
         except Exception as e:
             print(f"Failed to save progress: {e}")
 
-    def _get_display_info(self, token) -> Tuple[str, str]:
-        """Returns (Display Text, Spoken Text) for a token."""
-        # Check dictionary first
+    def _get_display_info(self, token: str) -> Tuple[str, str]:
         if token in TOKEN_MAP:
             return TOKEN_MAP[token]
-        
-        # Check for curly quotes often found in books
-        if token in ['“', '”', '"']: 
+
+        if token in SYMBOL_NAME_MAP:
+            return SYMBOL_NAME_MAP[token]
+
+        if token in ["“", "”", '"']:
             return ("<QUOTE>", "quote")
-            
-        # Default: It's a word
+
+        if len(token) == 1:
+            category = unicodedata.category(token)
+            if category.startswith(("P", "S")):
+                symbol_name = unicodedata.name(token, "")
+                if symbol_name:
+                    friendly_name = symbol_name.lower().replace("-", " ")
+                    return (f"<{symbol_name}>", friendly_name)
+
         return (token, token)
 
+    def _prime_audio_cache(self):
+        texts = []
+        for index in range(self.position, min(len(self.tokens), self.position + EDGE_PREFETCH_TOKENS)):
+            _, speak_text = self._get_display_info(self.tokens[index])
+            texts.append(speak_text)
+
+        self.engine.prefetch(texts)
+
     def run(self):
-        print("\n" + "="*40)
+        print("\n" + "=" * 40)
         print(f"Loaded {len(self.tokens)} tokens.")
         print("CONTROLS: [SPACE] Next  |  [BACKSPACE] Previous  |  [ESC] Quit")
-        print("="*40 + "\n")
+        print("=" * 40 + "\n")
 
-        # Show initial context
         display, _ = self._get_display_info(self.tokens[self.position])
         print(f"Ready at {self.position}/{len(self.tokens)}: {display}")
 
         while self.is_running:
-            # wait_until blocks nicely, saving CPU
             event = keyboard.read_event(suppress=True)
 
-            if event.event_type == keyboard.KEY_DOWN:
-                if event.name == 'esc':
-                    print("\nExiting...")
-                    self._save_progress()
-                    self.is_running = False
-                
-                elif event.name == 'space':
-                    if self.position < len(self.tokens):
-                        token = self.tokens[self.position]
-                        disp_text, speak_text = self._get_display_info(token)
-                        
-                        print(f"[{self.position}] {disp_text}")
-                        self.engine.say(speak_text)
-                        
-                        self.position += 1
-                        
-                        # Saving on every single step (No optimization)
-                        self._save_progress()
-                    else:
-                        print("End of file reached.")
+            if event.event_type != keyboard.KEY_DOWN:
+                continue
 
-                elif event.name == 'backspace':
-                    if self.position > 0:
-                        self.position -= 1
-                        token = self.tokens[self.position]
-                        disp_text, _ = self._get_display_info(token)
-                        print(f"<- Back to: {disp_text}")
-                        # Saving on every single step
-                        self._save_progress()
+            if event.name == "esc":
+                print("\nExiting...")
+                self._save_progress()
+                self.engine.shutdown()
+                self.is_running = False
+                continue
+
+            if event.name == "space":
+                if self.position >= len(self.tokens):
+                    print("End of file reached.")
+                    continue
+
+                token = self.tokens[self.position]
+                display_text, speak_text = self._get_display_info(token)
+                print(f"[{self.position}] {display_text}")
+                self.engine.say(speak_text)
+                self.position += 1
+                self._save_progress()
+                self._prime_audio_cache()
+                continue
+
+            if event.name == "backspace" and self.position > 0:
+                self.position -= 1
+                token = self.tokens[self.position]
+                display_text, _ = self._get_display_info(token)
+                print(f"<- Back to: {display_text}")
+                self._save_progress()
+                self._prime_audio_cache()
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Read a text file one token at a time.")
     parser.add_argument("file", nargs="?", help="Path to the text file to read.")
     parser.add_argument(
         "--voice",
-        help="Voice name or partial description to use. Example: --voice Zira",
+        help="Voice name or partial description to use. Example: --voice Ava, --voice female, or --voice male",
     )
     parser.add_argument(
         "--choose-voice",
@@ -425,7 +802,13 @@ def parse_args():
     parser.add_argument(
         "--list-voices",
         action="store_true",
-        help="List detected voices and exit.",
+        help="List detected voices for the selected backend and exit.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "edge", "winrt", "sapi"],
+        default="auto",
+        help="Speech backend to use. 'auto' prefers edge neural voices, then local Windows voices.",
     )
     return parser.parse_args()
 
@@ -434,10 +817,16 @@ if __name__ == "__main__":
     args = parse_args()
 
     if args.list_voices:
-        engine = WindowsSpeechEngine(preferred_voice=args.voice, prompt_for_voice=False, quiet=True)
-        print("\nDetected voices:")
+        engine = WindowsSpeechEngine(
+            preferred_voice=args.voice,
+            prompt_for_voice=False,
+            quiet=True,
+            backend_preference=args.backend,
+        )
+        print(f"\nDetected voices [{engine.backend.upper()}]:")
         for description in engine.list_voice_descriptions():
             print(f"- {description}")
+        engine.shutdown()
         sys.exit(0)
 
     target_file = args.file or ""
@@ -454,6 +843,7 @@ if __name__ == "__main__":
             target_file,
             preferred_voice=args.voice,
             prompt_for_voice=args.choose_voice,
+            backend_preference=args.backend,
         )
         app.run()
     except KeyboardInterrupt:
