@@ -79,6 +79,34 @@ SYMBOL_NAME_MAP = {
     "~": ("<TILDE>", "tilde"),
     "`": ("<BACKTICK>", "backtick"),
 }
+CARDINAL_NUMBER_WORDS = {
+    0: "zero",
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+    11: "eleven",
+    12: "twelve",
+}
+SINGULAR_ORDINAL_DENOMINATORS = {
+    2: "half",
+    3: "third",
+    4: "fourth",
+    5: "fifth",
+    6: "sixth",
+    7: "seventh",
+    8: "eighth",
+    9: "ninth",
+    10: "tenth",
+    11: "eleventh",
+    12: "twelfth",
+}
 
 APP_DIR = os.path.dirname(__file__)
 SETTINGS_FILE = os.path.join(APP_DIR, "readword_settings.json")
@@ -674,43 +702,68 @@ class BookReader:
             prompt_for_voice=prompt_for_voice,
             backend_preference=backend_preference,
         )
-        self.tokens = self._tokenize_file()
+        self.source_text = self._read_file_text()
+        self.source_hash = self._hash_text(self.source_text)
+        self.tokens = self._tokenize_text(self.source_text)
         self.position = self._load_progress()
         self.is_running = True
         self._prime_audio_cache()
 
-    def _tokenize_file(self) -> List[str]:
+    def _read_file_text(self) -> str:
         if not os.path.exists(self.filepath):
             print(f"Error: File {self.filepath} not found.")
             sys.exit(1)
 
         with open(self.filepath, "r", encoding="utf-8") as f:
-            text = f.read()
+            return f.read()
 
-        pattern = r"\.\.\.|[\w'’]+|[^\w\s]|\n"
+    def _hash_text(self, text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+    def _tokenize_text(self, text: str) -> List[str]:
+        pattern = r"\d+/\d+(?:\s*th)?|[Vv]\.|\.{3}|[\w'’]+|[^\w\s]|\n"
         return [t for t in re.findall(pattern, text) if t.strip() or t == "\n"]
+
+    def _write_progress_file(self, position: int):
+        with open(self.save_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "position": position,
+                    "timestamp": str(datetime.now()),
+                    "source_hash": self.source_hash,
+                },
+                f,
+            )
+
+    def _should_reset_progress_for_changed_text(self) -> bool:
+        print("\nThe text file changed since the last saved progress.")
+        print("Reset saved progress and start from the beginning? [Y/n]")
+        choice = input("> ").strip().lower()
+        return choice in {"", "y", "yes"}
 
     def _load_progress(self) -> int:
         if os.path.exists(self.save_file):
             try:
                 with open(self.save_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    position = data.get("position", 0)
-                    return max(0, min(position, len(self.tokens) - 1))
+                    position = max(0, min(data.get("position", 0), len(self.tokens) - 1))
+                    saved_hash = data.get("source_hash")
+
+                    if saved_hash and saved_hash != self.source_hash:
+                        if self._should_reset_progress_for_changed_text():
+                            self._write_progress_file(0)
+                            return 0
+
+                        self._write_progress_file(position)
+
+                    return position
             except Exception:
                 pass
         return 0
 
     def _save_progress(self):
         try:
-            with open(self.save_file, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "position": self.position,
-                        "timestamp": str(datetime.now()),
-                    },
-                    f,
-                )
+            self._write_progress_file(self.position)
         except Exception as e:
             print(f"Failed to save progress: {e}")
 
@@ -724,12 +777,38 @@ class BookReader:
         if token in ["“", "”", '"']:
             return ("<QUOTE>", "quote")
 
+        if re.fullmatch(r"\d+/\d+(?:\s*th)?", token):
+            numerator_text, denominator_text = token.split("/", 1)
+            denominator_text = denominator_text.replace(" ", "")
+            denominator_text = re.sub(r"th$", "", denominator_text)
+            numerator = int(numerator_text)
+            denominator = int(denominator_text)
+
+            numerator_word = CARDINAL_NUMBER_WORDS.get(numerator, str(numerator))
+            denominator_word = SINGULAR_ORDINAL_DENOMINATORS.get(denominator)
+
+            if denominator_word:
+                if numerator != 1:
+                    if denominator_word.endswith("f"):
+                        denominator_word = denominator_word[:-1] + "ves"
+                    else:
+                        denominator_word += "s"
+                return (token, f"{numerator_word} {denominator_word}")
+
+            return (token, f"{numerator} over {denominator}")
+
+        if token.casefold() in {"v.", "vs"}:
+            return (token, "versus")
+
         if token.isdigit() and len(token) == 4:
             first_half = token[:2]
             second_half = token[2:]
             if second_half.startswith("0"):
                 return (token, f"{first_half} oh {int(second_half)}")
             return (token, f"{first_half} {second_half}")
+
+        if token.isalpha() and token.isupper() and len(token) > 1:
+            return (token, " ".join(token))
 
         if len(token) == 1:
             category = unicodedata.category(token)
