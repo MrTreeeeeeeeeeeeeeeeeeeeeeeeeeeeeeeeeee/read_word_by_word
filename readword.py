@@ -724,6 +724,13 @@ class BookReader:
         if token in ["“", "”", '"']:
             return ("<QUOTE>", "quote")
 
+        if token.isdigit() and len(token) == 4:
+            first_half = token[:2]
+            second_half = token[2:]
+            if second_half.startswith("0"):
+                return (token, f"{first_half} oh {int(second_half)}")
+            return (token, f"{first_half} {second_half}")
+
         if len(token) == 1:
             category = unicodedata.category(token)
             if category.startswith(("P", "S")):
@@ -766,7 +773,9 @@ class BookReader:
 
             if event.name == "space":
                 if self.position >= len(self.tokens):
-                    print("End of file reached.")
+                    message = "End of file reached."
+                    print(message)
+                    self.engine.say(message)
                     continue
 
                 token = self.tokens[self.position]
