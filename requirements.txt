@@ -1,3 +1,8 @@
 keyboard>=0.13.5
 pywin32>=305
-pyttsx3>=2.90 
+pyttsx3>=2.90
+winrt-runtime>=3.2.1
+winrt-Windows.Foundation>=3.2.1
+winrt-Windows.Foundation.Collections>=3.2.1
+winrt-Windows.Media.Playback>=3.2.1
+winrt-Windows.Media.SpeechSynthesis>=3.2.1
