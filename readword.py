@@ -94,6 +94,39 @@ CARDINAL_NUMBER_WORDS = {
     11: "eleven",
     12: "twelve",
 }
+ORDINAL_NUMBER_WORDS = {
+    1: "first",
+    2: "second",
+    3: "third",
+    4: "fourth",
+    5: "fifth",
+    6: "sixth",
+    7: "seventh",
+    8: "eighth",
+    9: "ninth",
+    10: "tenth",
+    11: "eleventh",
+    12: "twelfth",
+    13: "thirteenth",
+    14: "fourteenth",
+    15: "fifteenth",
+    16: "sixteenth",
+    17: "seventeenth",
+    18: "eighteenth",
+    19: "nineteenth",
+    20: "twentieth",
+    21: "twenty first",
+    22: "twenty second",
+    23: "twenty third",
+    24: "twenty fourth",
+    25: "twenty fifth",
+    26: "twenty sixth",
+    27: "twenty seventh",
+    28: "twenty eighth",
+    29: "twenty ninth",
+    30: "thirtieth",
+    31: "thirty first",
+}
 SINGULAR_ORDINAL_DENOMINATORS = {
     2: "half",
     3: "third",
@@ -721,8 +754,15 @@ class BookReader:
         return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
     def _tokenize_text(self, text: str) -> List[str]:
-        pattern = r"\d+/\d+(?:\s*th)?|[Vv]\.|\.{3}|[\w'’]+|[^\w\s]|\n"
+        pattern = r"(?:[A-Za-z]\.){2,}[A-Za-z]?\.?|\d{4}-\d{4}s?|\d+\s*(?:st|nd|rd|th)|\d+/\d+(?:\s*th)?|[Vv]s\.|[Vv]\.|\.{3}|[\w'’]+|[^\w\s]|\n"
         return [t for t in re.findall(pattern, text) if t.strip() or t == "\n"]
+
+    def _speak_four_digit_number(self, token: str) -> str:
+        first_half = token[:2]
+        second_half = token[2:]
+        if second_half.startswith("0"):
+            return f"{first_half} oh {int(second_half)}"
+        return f"{first_half} {second_half}"
 
     def _write_progress_file(self, position: int):
         with open(self.save_file, "w", encoding="utf-8") as f:
@@ -777,6 +817,25 @@ class BookReader:
         if token in ["“", "”", '"']:
             return ("<QUOTE>", "quote")
 
+        dotted_acronym_match = re.fullmatch(r"(?:[A-Za-z]\.){2,}[A-Za-z]?\.?", token)
+        if dotted_acronym_match:
+            letters = [char for char in token if char.isalpha()]
+            return (token, " ".join(letter.upper() for letter in letters))
+
+        year_range_match = re.fullmatch(r"(\d{4})-(\d{4}s?)", token)
+        if year_range_match:
+            start_year = year_range_match.group(1)
+            end_year = year_range_match.group(2)
+            return (token, f"{self._speak_four_digit_number(start_year)} to {end_year}")
+
+        ordinal_match = re.fullmatch(r"(\d+)\s*(st|nd|rd|th)", token, flags=re.IGNORECASE)
+        if ordinal_match:
+            number = int(ordinal_match.group(1))
+            ordinal_word = ORDINAL_NUMBER_WORDS.get(number)
+            if ordinal_word:
+                return (token, ordinal_word)
+            return (token, token.replace(" ", ""))
+
         if re.fullmatch(r"\d+/\d+(?:\s*th)?", token):
             numerator_text, denominator_text = token.split("/", 1)
             denominator_text = denominator_text.replace(" ", "")
@@ -797,15 +856,11 @@ class BookReader:
 
             return (token, f"{numerator} over {denominator}")
 
-        if token.casefold() in {"v.", "vs"}:
+        if token.casefold() in {"v.", "vs", "vs."}:
             return (token, "versus")
 
         if token.isdigit() and len(token) == 4:
-            first_half = token[:2]
-            second_half = token[2:]
-            if second_half.startswith("0"):
-                return (token, f"{first_half} oh {int(second_half)}")
-            return (token, f"{first_half} {second_half}")
+            return (token, self._speak_four_digit_number(token))
 
         if token.isalpha() and token.isupper() and len(token) > 1:
             return (token, " ".join(token))
