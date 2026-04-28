@@ -5,16 +5,16 @@ import ctypes
 import hashlib
 import json
 import os
-import re
 import sys
 import threading
-import unicodedata
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import keyboard
 import win32com.client
 import winreg
+
+from readword_core import EOF_MESSAGE, ReaderSession
 
 try:
     import edge_tts
@@ -38,114 +38,10 @@ except ImportError:
 
 # --- CONFIGURATION ---
 
-TOKEN_MAP = {
-    "\n": ("<NEW LINE>", "new line"),
-    "...": ("<ELLIPSIS>", "ellipsis"),
-    "…": ("<ELLIPSIS>", "ellipsis"),
-    ".": ("<PERIOD>", "period"),
-    ",": ("<COMMA>", "comma"),
-    ":": ("<COLON>", "colon"),
-    ";": ("<SEMICOLON>", "semicolon"),
-    "!": ("<EXCLAMATION>", "exclamation mark"),
-    "?": ("<QUESTION>", "question mark"),
-    '"': ("<QUOTE>", "quote"),
-    "“": ("<QUOTE>", "quote"),
-    "”": ("<QUOTE>", "quote"),
-    "-": ("<DASH>", "dash"),
-    "—": ("<EM DASH>", "dash"),
-}
-SYMBOL_NAME_MAP = {
-    "(": ("<LEFT PARENTHESIS>", "left parenthesis"),
-    ")": ("<RIGHT PARENTHESIS>", "right parenthesis"),
-    "[": ("<LEFT BRACKET>", "left bracket"),
-    "]": ("<RIGHT BRACKET>", "right bracket"),
-    "{": ("<LEFT BRACE>", "left brace"),
-    "}": ("<RIGHT BRACE>", "right brace"),
-    "<": ("<LESS THAN>", "less than"),
-    ">": ("<GREATER THAN>", "greater than"),
-    "/": ("<SLASH>", "slash"),
-    "\\": ("<BACKSLASH>", "backslash"),
-    "|": ("<VERTICAL BAR>", "vertical bar"),
-    "_": ("<UNDERSCORE>", "underscore"),
-    "=": ("<EQUALS>", "equals sign"),
-    "+": ("<PLUS>", "plus sign"),
-    "*": ("<ASTERISK>", "asterisk"),
-    "&": ("<AMPERSAND>", "ampersand"),
-    "@": ("<AT>", "at sign"),
-    "#": ("<HASH>", "hash sign"),
-    "$": ("<DOLLAR>", "dollar sign"),
-    "%": ("<PERCENT>", "percent sign"),
-    "^": ("<CARET>", "caret"),
-    "~": ("<TILDE>", "tilde"),
-    "`": ("<BACKTICK>", "backtick"),
-}
-CARDINAL_NUMBER_WORDS = {
-    0: "zero",
-    1: "one",
-    2: "two",
-    3: "three",
-    4: "four",
-    5: "five",
-    6: "six",
-    7: "seven",
-    8: "eight",
-    9: "nine",
-    10: "ten",
-    11: "eleven",
-    12: "twelve",
-}
-ORDINAL_NUMBER_WORDS = {
-    1: "first",
-    2: "second",
-    3: "third",
-    4: "fourth",
-    5: "fifth",
-    6: "sixth",
-    7: "seventh",
-    8: "eighth",
-    9: "ninth",
-    10: "tenth",
-    11: "eleventh",
-    12: "twelfth",
-    13: "thirteenth",
-    14: "fourteenth",
-    15: "fifteenth",
-    16: "sixteenth",
-    17: "seventeenth",
-    18: "eighteenth",
-    19: "nineteenth",
-    20: "twentieth",
-    21: "twenty first",
-    22: "twenty second",
-    23: "twenty third",
-    24: "twenty fourth",
-    25: "twenty fifth",
-    26: "twenty sixth",
-    27: "twenty seventh",
-    28: "twenty eighth",
-    29: "twenty ninth",
-    30: "thirtieth",
-    31: "thirty first",
-}
-SINGULAR_ORDINAL_DENOMINATORS = {
-    2: "half",
-    3: "third",
-    4: "fourth",
-    5: "fifth",
-    6: "sixth",
-    7: "seventh",
-    8: "eighth",
-    9: "ninth",
-    10: "tenth",
-    11: "eleventh",
-    12: "twelfth",
-}
-
 APP_DIR = os.path.dirname(__file__)
 SETTINGS_FILE = os.path.join(APP_DIR, "readword_settings.json")
 CACHE_DIR = os.path.join(APP_DIR, ".tts_cache")
 EDGE_PLAYBACK_ALIAS = "readword_tts"
-EDGE_PREFETCH_TOKENS = 24
 EDGE_STALE_TEMP_SECONDS = 120
 
 PREFERRED_EDGE_VOICES = [
@@ -343,6 +239,20 @@ class WindowsSpeechEngine:
             return [self._voice_label(voice) for voice in self._load_edge_voice_catalog_entries()]
 
         return [self._voice_name(voice) for voice in self.voices]
+
+    def current_voice_name(self) -> str:
+        if self.backend == "edge":
+            return self.selected_voice or ""
+        if self.backend == "winrt":
+            return self.synthesizer.voice.display_name if self.synthesizer.voice else ""
+        return self.speaker.Voice.GetDescription() if self.speaker.Voice else ""
+
+    def current_voice_label(self) -> str:
+        if self.backend == "edge":
+            return self._voice_label(self.selected_voice) if self.selected_voice else ""
+        if self.backend == "winrt":
+            return self._voice_label(self.synthesizer.voice) if self.synthesizer.voice else ""
+        return self._voice_label(self.speaker.Voice) if self.speaker.Voice else ""
 
     def _load_edge_voice_catalog_entries(self) -> List[str]:
         catalog = self._load_edge_voice_catalog()
@@ -729,51 +639,17 @@ class BookReader:
         backend_preference: str = "auto",
     ):
         self.filepath = filepath
-        self.save_file = os.path.splitext(filepath)[0] + "_progress.json"
         self.engine = WindowsSpeechEngine(
             preferred_voice=preferred_voice,
             prompt_for_voice=prompt_for_voice,
             backend_preference=backend_preference,
         )
-        self.source_text = self._read_file_text()
-        self.source_hash = self._hash_text(self.source_text)
-        self.tokens = self._tokenize_text(self.source_text)
-        self.position = self._load_progress()
+        self.session = ReaderSession(
+            filepath,
+            on_changed_file=self._should_reset_progress_for_changed_text,
+        )
         self.is_running = True
         self._prime_audio_cache()
-
-    def _read_file_text(self) -> str:
-        if not os.path.exists(self.filepath):
-            print(f"Error: File {self.filepath} not found.")
-            sys.exit(1)
-
-        with open(self.filepath, "r", encoding="utf-8") as f:
-            return f.read()
-
-    def _hash_text(self, text: str) -> str:
-        return hashlib.sha1(text.encode("utf-8")).hexdigest()
-
-    def _tokenize_text(self, text: str) -> List[str]:
-        pattern = r"(?:[A-Za-z]\.){2,}[A-Za-z]?\.?|\d{4}-\d{4}s?|\d+\s*(?:st|nd|rd|th)|\d+/\d+(?:\s*th)?|[Vv]s\.|[Vv]\.|\.{3}|[\w'’]+|[^\w\s]|\n"
-        return [t for t in re.findall(pattern, text) if t.strip() or t == "\n"]
-
-    def _speak_four_digit_number(self, token: str) -> str:
-        first_half = token[:2]
-        second_half = token[2:]
-        if second_half.startswith("0"):
-            return f"{first_half} oh {int(second_half)}"
-        return f"{first_half} {second_half}"
-
-    def _write_progress_file(self, position: int):
-        with open(self.save_file, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "position": position,
-                    "timestamp": str(datetime.now()),
-                    "source_hash": self.source_hash,
-                },
-                f,
-            )
 
     def _should_reset_progress_for_changed_text(self) -> bool:
         print("\nThe text file changed since the last saved progress.")
@@ -781,116 +657,23 @@ class BookReader:
         choice = input("> ").strip().lower()
         return choice in {"", "y", "yes"}
 
-    def _load_progress(self) -> int:
-        if os.path.exists(self.save_file):
-            try:
-                with open(self.save_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    position = max(0, min(data.get("position", 0), len(self.tokens) - 1))
-                    saved_hash = data.get("source_hash")
-
-                    if saved_hash and saved_hash != self.source_hash:
-                        if self._should_reset_progress_for_changed_text():
-                            self._write_progress_file(0)
-                            return 0
-
-                        self._write_progress_file(position)
-
-                    return position
-            except Exception:
-                pass
-        return 0
-
     def _save_progress(self):
         try:
-            self._write_progress_file(self.position)
+            self.session.save_progress()
         except Exception as e:
             print(f"Failed to save progress: {e}")
 
-    def _get_display_info(self, token: str) -> Tuple[str, str]:
-        if token in TOKEN_MAP:
-            return TOKEN_MAP[token]
-
-        if token in SYMBOL_NAME_MAP:
-            return SYMBOL_NAME_MAP[token]
-
-        if token in ["“", "”", '"']:
-            return ("<QUOTE>", "quote")
-
-        dotted_acronym_match = re.fullmatch(r"(?:[A-Za-z]\.){2,}[A-Za-z]?\.?", token)
-        if dotted_acronym_match:
-            letters = [char for char in token if char.isalpha()]
-            return (token, " ".join(letter.upper() for letter in letters))
-
-        year_range_match = re.fullmatch(r"(\d{4})-(\d{4}s?)", token)
-        if year_range_match:
-            start_year = year_range_match.group(1)
-            end_year = year_range_match.group(2)
-            return (token, f"{self._speak_four_digit_number(start_year)} to {end_year}")
-
-        ordinal_match = re.fullmatch(r"(\d+)\s*(st|nd|rd|th)", token, flags=re.IGNORECASE)
-        if ordinal_match:
-            number = int(ordinal_match.group(1))
-            ordinal_word = ORDINAL_NUMBER_WORDS.get(number)
-            if ordinal_word:
-                return (token, ordinal_word)
-            return (token, token.replace(" ", ""))
-
-        if re.fullmatch(r"\d+/\d+(?:\s*th)?", token):
-            numerator_text, denominator_text = token.split("/", 1)
-            denominator_text = denominator_text.replace(" ", "")
-            denominator_text = re.sub(r"th$", "", denominator_text)
-            numerator = int(numerator_text)
-            denominator = int(denominator_text)
-
-            numerator_word = CARDINAL_NUMBER_WORDS.get(numerator, str(numerator))
-            denominator_word = SINGULAR_ORDINAL_DENOMINATORS.get(denominator)
-
-            if denominator_word:
-                if numerator != 1:
-                    if denominator_word.endswith("f"):
-                        denominator_word = denominator_word[:-1] + "ves"
-                    else:
-                        denominator_word += "s"
-                return (token, f"{numerator_word} {denominator_word}")
-
-            return (token, f"{numerator} over {denominator}")
-
-        if token.casefold() in {"v.", "vs", "vs."}:
-            return (token, "versus")
-
-        if token.isdigit() and len(token) == 4:
-            return (token, self._speak_four_digit_number(token))
-
-        if token.isalpha() and token.isupper() and len(token) > 1:
-            return (token, " ".join(token))
-
-        if len(token) == 1:
-            category = unicodedata.category(token)
-            if category.startswith(("P", "S")):
-                symbol_name = unicodedata.name(token, "")
-                if symbol_name:
-                    friendly_name = symbol_name.lower().replace("-", " ")
-                    return (f"<{symbol_name}>", friendly_name)
-
-        return (token, token)
-
     def _prime_audio_cache(self):
-        texts = []
-        for index in range(self.position, min(len(self.tokens), self.position + EDGE_PREFETCH_TOKENS)):
-            _, speak_text = self._get_display_info(self.tokens[index])
-            texts.append(speak_text)
-
-        self.engine.prefetch(texts)
+        self.engine.prefetch(self.session.prefetch_texts())
 
     def run(self):
         print("\n" + "=" * 40)
-        print(f"Loaded {len(self.tokens)} tokens.")
+        print(f"Loaded {len(self.session.tokens)} tokens.")
         print("CONTROLS: [SPACE] Next  |  [BACKSPACE] Previous  |  [ESC] Quit")
         print("=" * 40 + "\n")
 
-        display, _ = self._get_display_info(self.tokens[self.position])
-        print(f"Ready at {self.position}/{len(self.tokens)}: {display}")
+        current_token = self.session.current()
+        print(f"Ready at {self.session.position}/{len(self.session.tokens)}: {current_token.display_text}")
 
         while self.is_running:
             event = keyboard.read_event(suppress=True)
@@ -906,27 +689,20 @@ class BookReader:
                 continue
 
             if event.name == "space":
-                if self.position >= len(self.tokens):
-                    message = "End of file reached."
-                    print(message)
-                    self.engine.say(message)
+                token = self.session.next()
+                if token.is_eof:
+                    print(EOF_MESSAGE)
+                    self.engine.say(EOF_MESSAGE)
                     continue
 
-                token = self.tokens[self.position]
-                display_text, speak_text = self._get_display_info(token)
-                print(f"[{self.position}] {display_text}")
-                self.engine.say(speak_text)
-                self.position += 1
-                self._save_progress()
+                print(f"[{token.position}] {token.display_text}")
+                self.engine.say(token.speak_text)
                 self._prime_audio_cache()
                 continue
 
-            if event.name == "backspace" and self.position > 0:
-                self.position -= 1
-                token = self.tokens[self.position]
-                display_text, _ = self._get_display_info(token)
-                print(f"<- Back to: {display_text}")
-                self._save_progress()
+            if event.name == "backspace" and self.session.position > 0:
+                token = self.session.previous()
+                print(f"<- Back to: {token.display_text}")
                 self._prime_audio_cache()
 
 
